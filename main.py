@@ -6,9 +6,12 @@ import uuid
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, RTCConfiguration, RTCIceServer
 from aiortc.contrib.signaling import BYE
 from av import VideoFrame
+from dotenv import load_dotenv
+import os
+import sys
 import time
+import logging
 
-JWT = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIwMTk2OGI0Yi01MTFjLTczMTMtYmY0YS01YWIzMGJkYzAzNGYiLCJ0b2tlbl90eXBlIjoiQ2FyIiwiZW1haWwiOm51bGwsImV4cCI6MTc0NjY5ODUxNSwiaXNfc3VwZXIiOm51bGwsImlhdCI6MTc0NjA5MzcxNX0.HBvVfvPcprWSiIbDMKkuWqYfhDeYF6sPLAZva0i_Kjw"
 
 class CameraStreamTrack(VideoStreamTrack):
     def __init__(self):
@@ -28,102 +31,123 @@ class CameraStreamTrack(VideoStreamTrack):
         video_frame.time_base = time_base
         return video_frame
 
-async def run_offer(signaling_url: str, peer_id: str):
 
-    # Send offer to signaling server
-    async with aiohttp.ClientSession() as session:
-        async with session.ws_connect(signaling_url) as ws:
-            pc = None
-            local_id = peer_id
-            ices = []
+class Streamer:
+    def __init__(self):
+        load_dotenv()
+        self.uuid = os.environ.get('CAR_UUID')
+        self.key= os.environ.get('CAR_KEY')
 
-            await ws.send_json({
-                #"type": pc.localDescription.type,
-                "uuid": local_id,
-                "type": "register",
-                "jwt": JWT,
-                "role": "streamer",
-            })
+        self.server_url = os.environ.get('SERVER_URL')
+        self.ws_url = os.environ.get('WS_URL')
+        self.jwt = None
 
-            async for msg in ws:
-                #print(msg)
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    payload = json.loads(msg.data)
+    async def get_jwt(self):
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f'{self.server_url}/car/jwt', json={
+                    'id': self.uuid, 'key': self.key    
+                }) as response:
 
-                    if payload.get("type", "") == "error":
-                        print(payload.get("msg", ""))
+                response = await response.json()
 
-                    if payload.get("type", "") == "offer":
-                        offer = RTCSessionDescription(
-                            sdp=payload["sdp"],
-                            type=payload["type"]
-                        )
+                return response['access_token']
 
-                        pc = RTCPeerConnection(RTCConfiguration(iceServers=[
-                            RTCIceServer("stun:stun.l.google.com:19302"),
-                            RTCIceServer("stun:stun1.l.google.com:19302")
-                        ]))
-                        pc.addTrack(CameraStreamTrack())  # This thing takes about a second
+    async def run_offer(self):
+        self.jwt = await self.get_jwt()
+        print(self.jwt)
+        # Send offer to signaling server
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(f'{self.ws_url}/ws') as ws:
+                pc = None
+                ices = []
 
-                        for ice in ices:
-                            await pc.addIceCandidate(ice)
+                await ws.send_json({
+                    "uuid": self.uuid,
+                    "type": "register",
+                    "jwt": self.jwt,
+                    "role": "streamer",
+                })
 
-                        @pc.on("icecandidate")
-                        async def on_icecandidate(candidate):
-                            print(candidate)
-                            if candidate:
-                                # Send to signaling server
-                                await ws.send_json({
-                                    "uuid": local_id,
-                                    "type": "ice-candidate",
-                                    "candidate": candidate,
-                                    "to": payload["uuid"]
-                                })
+                logging.info('Sent request for joining to signaling server')
 
-                        @pc.on("datachannel")
-                        def on_datachannel(channel):
-                            print("Data channel created:", channel.label)
+                async for msg in ws:
+                    logging.info(f'Received message {msg.type}')
+                    #print(msg)
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        payload = json.loads(msg.data)
 
-                            @channel.on("message")
-                            def on_message(message):
-                                print("Received from viewer:", message)
-                                # Echo or process
-                                if isinstance(message, str):
-                                    try:
-                                        data = json.loads(message)
-                                        print("Parsed JSON:", data)
-                                    except Exception:
-                                        print("Received non-JSON message:", message)
+                        if payload.get("type", "") == "error":
+                            print(payload.get("msg", ""))
 
-                                # Optional: send a reply
-                                channel.send(json.dumps({"hello": "from streamer"}))
+                        if payload.get("type", "") == "offer":
+                            offer = RTCSessionDescription(
+                                sdp=payload["sdp"],
+                                type=payload["type"]
+                            )
+
+                            pc = RTCPeerConnection(RTCConfiguration(iceServers=[
+                                RTCIceServer("stun:stun.l.google.com:19302"),
+                                RTCIceServer("stun:stun1.l.google.com:19302")
+                            ]))
+                            pc.addTrack(CameraStreamTrack())  # This thing takes about a second
+
+                            for ice in ices:
+                                await pc.addIceCandidate(ice)
+
+                            @pc.on("icecandidate")
+                            async def on_icecandidate(candidate):
+                                print(candidate)
+                                if candidate:
+                                    # Send to signaling server
+                                    await ws.send_json({
+                                        "uuid": self.uuid,
+                                        "type": "ice-candidate",
+                                        "candidate": candidate,
+                                        "to": payload["uuid"]
+                                    })
+
+                            @pc.on("datachannel")
+                            def on_datachannel(channel):
+                                print("Data channel created:", channel.label)
+
+                                @channel.on("message")
+                                def on_message(message):
+                                    print("Received from viewer:", message)
+                                    # Echo or process
+                                    if isinstance(message, str):
+                                        try:
+                                            data = json.loads(message)
+                                            print("Parsed JSON:", data)
+                                        except Exception:
+                                            print("Received non-JSON message:", message)
+
+                                    # Optional: send a reply
+                                    channel.send(json.dumps({"hello": "from streamer"}))
 
 
-                        await pc.setRemoteDescription(offer)
-                        answer = await pc.createAnswer()
-                        await pc.setLocalDescription(answer)
+                            await pc.setRemoteDescription(offer)
+                            answer = await pc.createAnswer()
+                            await pc.setLocalDescription(answer)
 
-                        await ws.send_json({
-                            "uuid": local_id,
-                            "type": pc.localDescription.type,
-                            "to": payload["uuid"],
-                            "sdp": pc.localDescription.sdp
-                        })
-                    
-                    if payload.get("type", "") == "ice":
-                        if pc is None:
-                            ices.append(payload["ice"])
-                        else:
-                            asyncio.ensure_future(pc.addIceCandidate(payload["ice"]))
+                            await ws.send_json({
+                                "uuid": self.uuid,
+                                "type": pc.localDescription.type,
+                                "to": payload["uuid"],
+                                "sdp": pc.localDescription.sdp
+                            })
+                        
+                        if payload.get("type", "") == "ice":
+                            if pc is None:
+                                ices.append(payload["ice"])
+                            else:
+                                asyncio.ensure_future(pc.addIceCandidate(payload["ice"]))
 
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    break
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        break
 
-try:
-    peer_id = "01968b4b-511c-7313-bf4a-5ab30bdc034f"
-    print(f'Peer id is {peer_id}')
-    signaling_url = "ws://gl.anohin.fvds.ru:8080/ws"
-    asyncio.run(run_offer(signaling_url, peer_id))
-except KeyboardInterrupt:
-    print("Exiting...")
+if __name__ == "__main__":
+    logging.basicConfig(level='INFO')
+    streamer = Streamer()
+    asyncio.run(streamer.run_offer())
+
 
