@@ -48,13 +48,12 @@ class Streamer:
                     'id': self.uuid, 'key': self.key    
                 }) as response:
 
-                response = await response.json()
+                response = await response.json(content_type=None)
 
                 return response['access_token']
 
     async def run_offer(self):
         self.jwt = await self.get_jwt()
-        print(self.jwt)
         # Send offer to signaling server
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(f'{self.ws_url}/ws') as ws:
